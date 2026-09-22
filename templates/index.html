@@ -62,15 +62,15 @@
     </div>
 
     <div class="field-row slider-row">
-      <label for="retune">Retune speed</label>
-      <input type="range" id="retune" min="0" max="150" step="5" value="40">
+      <label for="retune" title="0 ms = robotic hard snap, 50-120 ms = natural (keeps vibrato and scoops)">Retune speed (robotic ← → natural)</label>
+      <input type="range" id="retune" min="0" max="200" step="5" value="40">
       <span class="readout" id="retune-readout">40 ms</span>
     </div>
 
     <div class="toggle-group">
       <label class="toggle"><input type="checkbox" id="use-phase-vocoder" checked><span>Phase vocoder</span></label>
       <label class="toggle"><input type="checkbox" id="use-formant" checked><span>Formant preservation</span></label>
-      <label class="toggle"><input type="checkbox" id="use-preemphasis" checked><span>Pre-emphasis filter</span></label>
+      <label class="toggle"><input type="checkbox" id="use-preemphasis"><span>Pre-emphasis filter</span></label>
       <label class="toggle"><input type="checkbox" id="use-noise-cancellation" checked><span>Noise cancellation 🔇</span></label>
     </div>
 

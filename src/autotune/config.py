@@ -81,10 +81,26 @@ class AutoTuneConfig:
         self.scale_type = scale_type            # "major", "natural_minor", "chromatic"
         self.correction_strength = correction_strength  # 0.0 = no correction, 1.0 = full snap
 
-        # How many ms it takes the correction to glide to the target note.
-        # 0 = instant/robotic snap every frame (old behavior).
-        # ~30-80 = natural-sounding correction. See pitch_shift.smooth_shift_ratios.
+        # Time constant of the low-pass filter applied to the pitch CORRECTION
+        # (see pitch_shift.compute_shift_ratios and docs/retune-and-naturalness.md).
+        # This one knob moves the output continuously from robotic to natural:
+        #   0-10 ms   -> hard snap, vibrato flattened, stepped note changes (robotic)
+        #   15-40 ms  -> tight modern pop correction
+        #   50-120 ms -> natural: vibrato, scoops and onsets pass through
+        #   150+ ms   -> only slow drift is corrected
         self.retune_ms = retune_ms
+
+        # Pitch search range for YIN. 60 Hz covers low rap/baritone registers,
+        # 1100 Hz covers soprano and falsetto. The same range is used for every
+        # genre (see docs/genre-robustness.md).
+        self.pitch_fmin = 60.0
+        self.pitch_fmax = 1100.0
+
+        # Scale quantisation hysteresis in semitones: a sustained pitch has to
+        # cross the midpoint between two scale notes by this much before the
+        # target note switches. Stops the target flip-flopping (a +/-1 semitone
+        # warble) when a singer hovers near the midpoint.
+        self.note_hysteresis = 0.25
 
 
 

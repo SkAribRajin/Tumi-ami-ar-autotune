@@ -87,136 +87,82 @@ When strength = 0.0: ratio = 1.0 (no change at all, since anything^0 = 1)
 When strength = 0.5: ratio = halfway between them ON THE LOG SCALE
 """
 
+"""
+One correction filter instead of separate modes
+=================================================
+Work in semitones. Per frame:
+    error[i] = 12*log2(target/detected)        how far this frame is from its note
+    u[i]     = confidence[i] * error[i]        confidence gating (0 for unvoiced)
+    c[i]     = c[i-1] + alpha*(u[i] - c[i-1])  one-pole low-pass, time constant retune_ms
+    ratio[i] = 2 ** (strength * c[i] / 12)
+
+The output pitch is detected + c, and the pitch is detected = note + deviation.
+So output = note + (deviation - LPF(deviation)) = note + HPF(deviation).
+The retune time constant tau sets the crossover fc = 1/(2*pi*tau):
+  - deviations SLOWER than fc (a note sung flat, drift) are removed -> in tune
+  - deviations FASTER than fc (vibrato ~5-7 Hz, scoops, onsets) pass through
+tau -> 0 pushes fc above the vibrato rate, which flattens vibrato and turns
+note changes into steps: the robotic sound. Larger tau keeps them: natural.
+Onset protection is the filter's starting state (c = 0 at a note start, so
+the attack is heard as sung while the correction ramps in). Vibrato
+preservation is its high-pass complement. No separate code paths.
+See docs/retune-and-naturalness.md.
+"""
+
 def compute_shift_ratios(detected_pitches, target_pitches, strength=1.0,
-                         preserve_vibrato=True, onset_protection_ms=30.0,
-                         humanize_cents=0.0, hop_size=512, sample_rate=44100):
+                         retune_ms=0.0, confidence=None, hop_size=512, sample_rate=44100,
+                         humanize_cents=0.0, max_correction_semitones=2.0):
     """
-    detected_pitches: shape (num_frames,) - detected pitch in Hz per frame
-    target_pitches:   shape (num_frames,) - target scale note in Hz per frame
-    strength:         float 0.0 to 1.0 - correction strength
-    preserve_vibrato: bool - if True, preserves natural 5-7 Hz vibrato oscillations around target note
-    onset_protection_ms: float - duration in ms to protect note attack pitch-bends
-    humanize_cents:   float - small cents jitter (e.g. 3.0) for natural organic variation
+    detected_pitches: shape (num_frames,) - detected pitch in Hz, 0 = unvoiced
+    target_pitches:   shape (num_frames,) - target scale note in Hz, 0 = unvoiced
+    strength:         0.0 = no correction, 1.0 = full correction (scales the
+                      correction in log/semitone space, same as before)
+    retune_ms:        correction low-pass time constant (0 = per-frame snap,
+                      identical to the original (target/detected)**strength)
+    confidence:       optional 0..1 voicing weight per frame (defaults to 1
+                      for voiced frames). Frames with low confidence get
+                      proportionally less correction.
+    humanize_cents:   optional small smoothed random pitch jitter
+    max_correction_semitones: safety clamp - a legitimate scale correction is
+                      never more than ~1 semitone, so anything bigger is a
+                      detection error and must not be applied.
+
+    Returns: shape (num_frames,) float32 ratios. Unvoiced frames get 1.0 when
+    retune_ms == 0; with retune_ms > 0 the correction decays smoothly toward
+    1.0 across unvoiced gaps instead of jumping.
     """
-    num_frames = len(detected_pitches)
-    ratios = np.ones(num_frames, dtype=np.float32)
-    voiced = detected_pitches > 0
+    detected = np.asarray(detected_pitches, dtype=np.float64)
+    target = np.asarray(target_pitches, dtype=np.float64)
+    num_frames = len(detected)
+    voiced = (detected > 0) & (target > 0)
 
-    if not np.any(voiced):
-        return ratios
+    error = np.zeros(num_frames)
+    error[voiced] = 12.0 * np.log2(target[voiced] / detected[voiced])
+    error = np.clip(error, -max_correction_semitones, max_correction_semitones)
 
-    raw_ratio = np.ones(num_frames, dtype=np.float32)
-    raw_ratio[voiced] = target_pitches[voiced] / detected_pitches[voiced]
+    if confidence is None:
+        weight = voiced.astype(np.float64)
+    else:
+        weight = np.where(voiced, np.clip(np.asarray(confidence, dtype=np.float64), 0.0, 1.0), 0.0)
+    u = weight * error
 
-    effective_target = np.copy(target_pitches)
-
-    # 1. Vibrato Handling: Preserve 5-7 Hz pitch oscillations around rolling center
-    if preserve_vibrato and num_frames > 5:
-        # 200ms rolling window for vibrato center estimation
-        window_len = max(3, int(0.200 * sample_rate / hop_size))
-        rolling_mean = np.zeros(num_frames, dtype=np.float32)
-
+    if retune_ms <= 0:
+        correction = u
+    else:
+        hop_ms = 1000.0 * hop_size / sample_rate
+        alpha = 1.0 - np.exp(-hop_ms / retune_ms)
+        correction = np.zeros(num_frames)
+        state = 0.0  # starts at "no correction": the natural onset
         for i in range(num_frames):
-            if not voiced[i]:
-                continue
-            start_i = max(0, i - window_len // 2)
-            end_i = min(num_frames, i + window_len // 2 + 1)
-            v_in_win = voiced[start_i:end_i]
-            if np.any(v_in_win):
-                rolling_mean[i] = np.mean(detected_pitches[start_i:end_i][v_in_win])
-            else:
-                rolling_mean[i] = detected_pitches[i]
+            state += alpha * (u[i] - state)
+            correction[i] = state
 
-        for i in range(num_frames):
-            if voiced[i] and rolling_mean[i] > 0:
-                vibrato_ratio = detected_pitches[i] / rolling_mean[i]
-                # Preserve vibrato fluctuation around target note
-                effective_target[i] = target_pitches[i] * vibrato_ratio
+    semitones = strength * correction
 
-    # 2. Note-Onset Protection: Protect initial milliseconds of a new note attack
-    hop_time_ms = (hop_size / sample_rate) * 1000.0
-    onset_frames = int(round(onset_protection_ms / hop_time_ms)) if hop_time_ms > 0 else 0
-
-    effective_strength = np.full(num_frames, strength, dtype=np.float32)
-    if onset_frames > 0:
-        voiced_run_len = 0
-        for i in range(num_frames):
-            if voiced[i]:
-                voiced_run_len += 1
-                if voiced_run_len <= onset_frames:
-                    # Gradually ramp strength from 0 to full strength during note onset
-                    ramp = voiced_run_len / float(onset_frames)
-                    effective_strength[i] = strength * ramp
-            else:
-                voiced_run_len = 0
-
-    # Calculate ratios with effective strength and target
-    for i in range(num_frames):
-        if voiced[i] and detected_pitches[i] > 0:
-            target_f = effective_target[i]
-            base_r = target_f / detected_pitches[i]
-            ratios[i] = base_r ** effective_strength[i]
-
-    # 3. Micro-pitch Humanization (cents jitter)
     if humanize_cents > 0.0:
         rng = np.random.default_rng(42)
-        # 1 semitone = 100 cents -> cent factor = 2^(cents / 1200)
         cents_noise = rng.uniform(-humanize_cents, humanize_cents, size=num_frames)
-        # Low-pass filter noise for smooth organic micro-fluctuation
-        smooth_jitter = np.convolve(cents_noise, np.ones(3)/3.0, mode='same')
-        jitter_ratios = 2.0 ** (smooth_jitter / 1200.0)
-        ratios[voiced] *= jitter_ratios[voiced]
+        smooth_jitter = np.convolve(cents_noise, np.ones(3) / 3.0, mode='same')
+        semitones = semitones + np.where(voiced, smooth_jitter / 100.0, 0.0)
 
-    return ratios.astype(np.float32)
-
-
-
-def smooth_shift_ratios(shift_ratios, detected_pitches, hop_size, sample_rate, retune_ms=40.0):
-    """
-    Smooths the per-frame correction ratio over time so pitch glides toward
-    the target note instead of snapping fully in a single ~11ms frame. This
-    is what separates a natural-sounding correction from the hard, robotic
-    "T-Pain" snap - compute_shift_ratios() alone recomputes a fresh target
-    every frame with no memory of the previous frame, so any jitter in the
-    detected pitch (very normal with autocorrelation + natural vibrato)
-    shows up directly as flutter in the corrected audio.
-
-    Uses an exponential moving average in the LOG of the ratio, not the raw
-    ratio - shift ratios are multiplicative (a ratio of 2.0 up and 0.5 down
-    are equally "one octave"), so averaging in log space is what keeps the
-    glide symmetric between upward and downward corrections.
-
-    The average resets at the start of every voiced run (i.e. after a
-    silence/unvoiced gap) so a new note starts clean instead of gliding in
-    from whatever the previous note's ratio happened to be.
-
-    retune_ms: how many milliseconds it takes to glide most of the way to
-    the target pitch.
-      0        -> no smoothing at all (identical to the old instant-snap behavior)
-      ~30-80   -> natural-sounding correction
-      100+     -> audible pitch bends/glides rather than a "correction"
-    """
-    if retune_ms <= 0:
-        return shift_ratios
-
-    log_ratios = np.log(shift_ratios.astype(np.float64))
-    smoothed_log = np.zeros_like(log_ratios)
-
-    hop_time_ms = (hop_size / sample_rate) * 1000.0
-    alpha = 1.0 - np.exp(-hop_time_ms / retune_ms)
-
-    prev = None
-    for i in range(len(log_ratios)):
-        if detected_pitches[i] <= 0:
-            # unvoiced: nothing to glide, and reset so the next note doesn't
-            # inherit a stale glide-in-progress from before the gap
-            smoothed_log[i] = log_ratios[i]
-            prev = None
-            continue
-        if prev is None:
-            smoothed_log[i] = log_ratios[i]  # first voiced frame of a run: start clean, no glide-in
-        else:
-            smoothed_log[i] = prev + alpha * (log_ratios[i] - prev)
-        prev = smoothed_log[i]
-
-    return np.exp(smoothed_log).astype(np.float32)
+    return (2.0 ** (semitones / 12.0)).astype(np.float32)

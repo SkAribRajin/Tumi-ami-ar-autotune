@@ -53,7 +53,7 @@ def process():
     retune_ms = float(request.form.get("retune_ms", 40.0))
     use_phase_vocoder = request.form.get("use_phase_vocoder", "true") == "true"
     use_formant_preservation = request.form.get("use_formant_preservation", "true") == "true"
-    use_preemphasis = request.form.get("use_preemphasis", "true") == "true"
+    use_preemphasis = request.form.get("use_preemphasis", "false") == "true"
     use_noise_cancellation = request.form.get("use_noise_cancellation", "true") == "true"
 
     config = AutoTuneConfig(

@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.ndimage import median_filter
 
 """
 A bit of music theory:
@@ -74,3 +75,90 @@ def nearest_scale_note(frequency, scale_midi_set):
     nearest_midi = scale_midi_set[idx]
 
     return midi_to_freq(nearest_midi)
+
+
+def quantize_pitch_track(pitches, scale_midi_set, hop_size=512, sample_rate=44100,
+                         hysteresis=0.25, center_ms=350.0, jump_semitones=0.85,
+                         confirm_ms=58.0):
+    """
+    Track-level version of nearest_scale_note, used by the pipeline.
+
+    Calling nearest_scale_note independently per frame has a failure mode:
+    a singer holding a note near the midpoint between two scale notes (or
+    with vibrato wider than the distance to that midpoint) makes the target
+    flip between the two notes from frame to frame. That is a +/-1-2
+    semitone square-wave warble in the output, and it sounds robotic at ANY
+    correction strength.
+
+    Within each voiced run (the choice resets at every unvoiced gap):
+      1. Note CENTRE = running median of the pitch (semitones) over
+         center_ms, about two vibrato cycles (4-7 Hz -> 140-250 ms per cycle).
+         The median over whole cycles is the vibrato centre; over ~1.5 cycles
+         a residual of +/-14 cents remained, enough to cross the hysteresis.
+         A running MEAN would
+         also smear fast note steps; that kept the old target for ~50 ms
+         after each rap syllable changed note (measured -135 cent
+         corrections on a line that was only 35 cents sharp).
+      2. Hysteresis: switch to a neighbouring note only when the centre is
+         closer to it by more than `hysteresis` semitones.
+      3. Fast notes: a long median would swallow notes shorter than half its
+         window (fast rap/melisma). So if the short-term pitch (58 ms median)
+         stays more than `jump_semitones` from the current note for
+         confirm_ms, it's a new note: switch, and backfill the confirming
+         frames. A vibrato peak can poke past jump_semitones but doesn't stay
+         there that long.
+
+    Returns target frequencies in Hz, shape (num_frames,), 0.0 where unvoiced.
+    """
+    pitches = np.asarray(pitches, dtype=np.float64)
+    n = len(pitches)
+    targets = np.zeros(n)
+    voiced = pitches > 0
+    if not voiced.any():
+        return targets
+
+    midi = np.zeros(n)
+    midi[voiced] = A4_MIDI + 12 * np.log2(pitches[voiced] / A4_FREQ)
+    frames_per_ms = sample_rate / hop_size / 1000.0
+    long_size = 2 * max(1, int(round(center_ms * frames_per_ms / 2))) + 1
+    short_size = 2 * max(1, int(round(58.0 * frames_per_ms / 2))) + 1
+    confirm_frames = max(1, int(round(confirm_ms * frames_per_ms)))
+    scale = np.asarray(scale_midi_set, dtype=np.float64)
+    nearest = lambda m: scale[np.argmin(np.abs(scale - m))]
+
+    i = 0
+    while i < n:
+        if not voiced[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and voiced[j]:
+            j += 1
+        run = midi[i:j]
+        centre = median_filter(run, size=long_size, mode='nearest')
+        short = median_filter(run, size=short_size, mode='nearest')
+
+        current = nearest(centre[0])
+        away = 0  # consecutive frames the short-term pitch has been far from `current`
+        for t in range(len(run)):
+            if abs(short[t] - current) > jump_semitones:
+                away += 1
+                if away >= confirm_frames:
+                    # a real new note, not a vibrato peak: switch, and backfill
+                    # the frames spent confirming it (we're offline, no latency)
+                    current = nearest(short[t])
+                    targets[i + t - away + 1:i + t] = midi_to_freq(current)
+                    away = 0
+            else:
+                away = 0
+                candidate = nearest(centre[t])
+                # the short-term pitch must agree, otherwise the long centre
+                # would undo a fast note it has swallowed
+                if (candidate != current
+                        and abs(centre[t] - current) - abs(centre[t] - candidate) > hysteresis
+                        and abs(short[t] - candidate) < abs(short[t] - current)):
+                    current = candidate
+            targets[i + t] = midi_to_freq(current)
+        i = j
+
+    return targets

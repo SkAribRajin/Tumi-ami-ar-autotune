@@ -33,18 +33,27 @@ work flow: original audio -> padding -> split into overlapping frames
 -> Hann window -> frames
 
 """
-def frame_signal(audio, config: AutoTuneConfig):
+def frame_signal(audio, config: AutoTuneConfig, apply_window=True):
+    """
+    apply_window=False returns the raw (unwindowed) frames with identical
+    frame positions - used for pitch detection, which needs the unshaped
+    waveform, while synthesis uses the Hann-windowed frames.
+    """
     N = config.frame_size
     H = config.hop_size
     pad_len = N
-    padded = np.concatenate([np.zeros(pad_len), audio, np.zeros(pad_len)])
+    # the tail gets one extra hop of zeros: with only N the last partial hop
+    # of the file (up to H-1 samples) was never covered by a frame and got
+    # dropped from the output
+    padded = np.concatenate([np.zeros(pad_len), audio, np.zeros(pad_len + H)])
 
     frame_number = ((len(padded)-N)//H)+1
     frames = np.zeros((frame_number, N), dtype=np.float32)
+    window = config.window if apply_window else 1.0
 
     for i in range(frame_number):
         start = i*H
-        frames[i] = padded[start: start+N]*config.window
+        frames[i] = padded[start: start+N]*window
 
     return frames, pad_len
 
@@ -69,7 +78,12 @@ frames[i]*config.window is basically: x[n]*(w[n])^2
 to remove the scaling factor we again divide the output by w[n]^2
 
 """
-def overlap_add(frames, config: AutoTuneConfig, pad_len):
+def overlap_add(frames, config: AutoTuneConfig, pad_len, length=None):
+    """
+    length: pass len(original_audio) to get output of exactly that length
+    (the pipeline does). Without it the result can be up to one hop longer,
+    the extra samples being the zero padding.
+    """
     N = config.frame_size
     H = config.hop_size
     frame_number = frames.shape[0]
@@ -87,4 +101,6 @@ def overlap_add(frames, config: AutoTuneConfig, pad_len):
     output[nonzero] /= window_sum[nonzero]
 
     #we remove the padding by starting from pad_len and ending at padlen samples before the end
+    if length is not None:
+        return output[pad_len: pad_len + length]
     return output[pad_len: -pad_len]
