@@ -7,14 +7,16 @@ Phase Vocoder Pitch Shifting
 ==============================
 See project chat history / report for full worked-example explanations of
 each piece. Summary:
-  1. compute_stft - magnitude + phase per frame
-  2. compute_instantaneous_frequency - precise per-bin frequency via phase tracking
-  3. find_peaks / assign_regions - locate spectral peaks (harmonics) and figure
-     out which bins "belong" to which peak (needed for phase locking, step 5)
-  4. remap_and_lock_spectrum - moves each peak's energy to the bin near its
-     shifted frequency, and drags its neighboring bins along with it, all
-     phase-locked to the peak so they don't drift apart from each other
-  5. phase_vocoder_shift - ties it all together (the CONTRACTS.md function)
+  1. zero-phase STFT of each frame (magnitude + phase at the frame centre)
+  2. find_peaks / assign_regions - locate spectral peaks (harmonics) and figure
+     out which bins "belong" to which peak
+  3. per peak: true frequency from the phase advance between frames, bin
+     offset for the new frequency, and one phase rotation for the whole region
+  4. phase_vocoder_shift - ties it all together (the CONTRACTS.md function),
+     with optional ratio-aware formant preservation
+  (The history below explains why energy has to be MOVED between bins; the
+  "Rewrite notes" further down explain what was still wrong with the first
+  fix and how the current version handles it.)
 
 --------------------------------------------------------------------------
 Why this version differs from a naive "keep magnitude in the same bin, just
@@ -46,55 +48,57 @@ The fix has two parts:
 --------------------------------------------------------------------------
 """
 
-def compute_stft(frames, config):
-    num_frames = frames.shape[0]
-    num_bins = config.frame_size // 2 + 1
-    magnitudes = np.zeros((num_frames, num_bins))
-    phases = np.zeros((num_frames, num_bins))
-    for i in range(num_frames):
-        spectrum = np.fft.rfft(frames[i])
-        magnitudes[i] = np.abs(spectrum)
-        phases[i] = np.angle(spectrum)
-    return magnitudes, phases
+"""
+Rewrite notes (see docs/diagnosis.md for the measurements):
 
+The previous remap_and_lock_spectrum kept ONE running phase per OUTPUT bin
+and only advanced it on frames where a peak happened to land in that bin.
+When a peak moved by one bin between frames (which happens with every bit
+of vibrato and every ratio change) it picked up a phase that was stale by
+several hops. Result: at ratio 1.0 the output had an SNR of -2 to -3 dB
+against the input, i.e. the phase was effectively scrambled. That is the
+"cloudy" sound. It also merged colliding bins with max() instead of adding
+them (loses energy), and ignored harmonics quieter than -26 dB, so their
+bins were shifted with a lower harmonic's offset (inharmonic smear).
+
+This version is Laroche & Dolson's (1999) phase-locked pitch shifter:
+  * zero-phase analysis (frame rotated by N/2 before the FFT) so the phase
+    of a peak bin is the sinusoid's phase at the FRAME CENTRE; all main-lobe
+    bins of a peak then share that phase
+  * every local maximum is a peak; each bin belongs to its nearest peak
+  * each peak region is moved by an integer number of bins
+        dk = round((ratio - 1) * true_frequency_in_bins)
+    and all its bins are multiplied by ONE complex rotation exp(j*theta)
+    (identity phase locking)
+  * the rotation is tracked per partial, not per output bin:
+        theta_i = theta_{i-1} + (ratio - 1) * Omega
+    where Omega is the partial's measured phase advance per hop. Ratio 1
+    therefore gives theta = 0 and the output is bit-identical to the input
+  * colliding bins are summed (complex), so energy is preserved
+"""
 
 def wrap_phase(phase_diff):
     return (phase_diff + np.pi) % (2 * np.pi) - np.pi
 
 
-def compute_instantaneous_frequency(phases, config):
-    num_frames, num_bins = phases.shape
-    freqs = np.zeros((num_frames, num_bins))
-    bin_center_freqs = np.arange(num_bins) * config.sample_rate / config.frame_size
-    expected_advance = 2 * np.pi * np.arange(num_bins) * config.hop_size / config.frame_size
-    freqs[0] = bin_center_freqs
-    for i in range(1, num_frames):
-        actual_advance = phases[i] - phases[i - 1]
-        deviation = wrap_phase(actual_advance - expected_advance)
-        extra_freq = deviation / (2 * np.pi) * (config.sample_rate / config.hop_size)
-        freqs[i] = bin_center_freqs + extra_freq
-    return freqs
-
-
-def find_peaks(magnitude, min_rel_height=0.05):
+def find_peaks(magnitude, min_rel_height=1e-5):
     """
-    Local maxima in the magnitude spectrum, i.e. one bin per harmonic.
-    min_rel_height filters out noise-floor "peaks" that aren't real harmonics -
-    a bin only counts if it's at least this fraction of the frame's loudest bin.
+    Local maxima of the magnitude spectrum. Every local maximum counts (down
+    to -100 dB relative to the frame's loudest bin), including weak upper
+    harmonics and noise. Each is shifted by its own frequency-proportional
+    amount, which is what keeps the upper harmonics harmonic.
     """
     num_bins = len(magnitude)
     if num_bins < 3:
-        return np.array([], dtype=int)
-    peak_mask = np.zeros(num_bins, dtype=bool)
-    peak_mask[1:-1] = (magnitude[1:-1] > magnitude[:-2]) & (magnitude[1:-1] > magnitude[2:])
+        return np.array([0], dtype=int)
     peak_max = magnitude.max()
     if peak_max <= 1e-12:
-        return np.array([], dtype=int)
-    peak_mask &= magnitude > (min_rel_height * peak_max)
-    peaks = np.flatnonzero(peak_mask)
+        return np.array([int(np.argmax(magnitude))])
+    mask = np.zeros(num_bins, dtype=bool)
+    mask[1:-1] = (magnitude[1:-1] > magnitude[:-2]) & (magnitude[1:-1] >= magnitude[2:])
+    mask &= magnitude > (min_rel_height * peak_max)
+    peaks = np.flatnonzero(mask)
     if len(peaks) == 0:
-        # silence/unvoiced frame with no clear local maxima - fall back to the
-        # single loudest bin so the frame still gets *some* representative peak
         peaks = np.array([int(np.argmax(magnitude))])
     return peaks
 
@@ -102,121 +106,103 @@ def find_peaks(magnitude, min_rel_height=0.05):
 def assign_regions(peaks, num_bins):
     """
     For every bin, which peak "owns" it (region of influence = nearer peak,
-    split at the midpoint between adjacent peaks). Needed so we know which
-    peak's phase each sidelobe bin should be locked to.
+    split at the midpoint between adjacent peaks).
     """
-    region = np.zeros(num_bins, dtype=int)
     if len(peaks) == 0:
-        return region
-    bins = np.arange(num_bins)
-    # midpoint boundaries between consecutive sorted peaks
+        return np.zeros(num_bins, dtype=int)
     boundaries = (peaks[:-1] + peaks[1:]) / 2.0
-    idx = np.searchsorted(boundaries, bins)
-    region = peaks[idx]
-    return region
+    return peaks[np.searchsorted(boundaries, np.arange(num_bins))]
 
 
-def remap_and_lock_spectrum(magnitude, phase, true_freq, running_phase, shift_ratio, config):
+def spectral_envelope_log(magnitude, frame_size, num_coeffs=30):
     """
-    Builds the shifted spectrum for one frame: moves each harmonic peak (and
-    the sidelobe bins around it) to a new bin near its shifted frequency, and
-    keeps their phases locked together relative to the peak.
-
-    running_phase: shape (num_bins,) float array, persistent across frames -
-    holds the accumulated phase per OUTPUT bin so frequency stays continuous
-    from frame to frame (this is mutated in place, same role the old
-    frame-to-frame phase accumulator played).
-
-    Returns: new_magnitude, new_phase (both shape (num_bins,))
+    Log spectral envelope (formant shape) of one magnitude spectrum via
+    cepstral liftering: keep the first num_coeffs quefrency samples. 30
+    samples at 44.1 kHz is 0.68 ms, well below the shortest pitch period
+    we track (1100 Hz -> 0.9 ms), so harmonics don't leak into the envelope.
     """
-    num_bins = len(magnitude)
-    bin_spacing = config.sample_rate / config.frame_size
-    hop_over_sr = config.hop_size / config.sample_rate
-
-    new_magnitude = np.zeros(num_bins)
-    new_phase = np.zeros(num_bins)
-
-    peaks = find_peaks(magnitude)
-    region = assign_regions(peaks, num_bins)
-
-    peak_target_bin = {}
-    for p in peaks:
-        target_freq = true_freq[p] * shift_ratio
-        target_bin = int(round(target_freq / bin_spacing)) if bin_spacing > 0 else p
-        if not (0 <= target_bin < num_bins):
-            continue
-        phase_advance = 2 * np.pi * target_freq * hop_over_sr
-        running_phase[target_bin] += phase_advance
-        peak_target_bin[p] = target_bin
-        if magnitude[p] > new_magnitude[target_bin]:
-            new_magnitude[target_bin] = magnitude[p]
-            new_phase[target_bin] = running_phase[target_bin]
-
-    # drag each peak's neighboring (sidelobe) bins along with it, preserving
-    # their phase relationship to the peak instead of letting them accumulate
-    # their own independent (and error-prone) phase trajectory
-    for j in range(num_bins):
-        p = region[j]
-        if p not in peak_target_bin or j == p:
-            continue
-        target_bin_p = peak_target_bin[p]
-        target_bin_j = target_bin_p + (j - p)
-        if not (0 <= target_bin_j < num_bins):
-            continue
-        offset = wrap_phase(phase[j] - phase[p])
-        candidate_phase = running_phase[target_bin_p] + offset
-        if magnitude[j] > new_magnitude[target_bin_j]:
-            new_magnitude[target_bin_j] = magnitude[j]
-            new_phase[target_bin_j] = candidate_phase
-
-    return new_magnitude, new_phase
+    cepstrum = np.fft.irfft(np.log(magnitude + 1e-9), n=frame_size)
+    cepstrum[num_coeffs:frame_size - num_coeffs + 1] = 0.0
+    return np.fft.rfft(cepstrum, n=frame_size).real
 
 
-def shift_and_resynthesize_phase(magnitudes, phases, true_freqs, shift_ratios, config):
+def reconstruct_frame(spectrum, config):
+    """Complex (zero-phase) spectrum -> time-domain frame in normal sample order."""
+    frame = np.fft.irfft(spectrum, n=config.frame_size)
+    return np.roll(frame, config.frame_size // 2).astype(np.float32)
+
+
+def phase_vocoder_shift(frames, shift_ratios, config, preserve_formants=False,
+                        formant_coeffs=30, max_formant_gain_db=12.0):
     """
-    Kept the original name/shape so nothing else in the pipeline needs to
-    change, but it now does spectrum remapping + phase locking per frame
-    (see module docstring) instead of independently pushing each bin's phase
-    while leaving its magnitude in place.
+    frames: (num_frames, frame_size) Hann-windowed frames from frame_signal()
+    shift_ratios: (num_frames,) one pitch ratio per frame
+    preserve_formants: if True, re-imposes the ORIGINAL frame's spectral
+        envelope on the shifted spectrum. Because we know the ratio, the
+        envelope the shift produced is just env(k / ratio), so the gain is
+        env(k) / env(k / ratio). No need to estimate an envelope from the gappy
+        shifted spectrum, which is what made the old formant_preserve apply
+        +4..+22 dB gain swings per frame.
 
-    Returns: new_magnitudes, new_phases - both shape (num_frames, num_bins),
-    replacing the original magnitudes/phases with the shifted spectrum.
+    Returns (num_frames, frame_size) float32 frames for overlap_add().
     """
-    num_frames, num_bins = phases.shape
-    new_magnitudes = np.zeros((num_frames, num_bins))
-    new_phases = np.zeros((num_frames, num_bins))
-    running_phase = np.zeros(num_bins)
-
-    for i in range(num_frames):
-        new_magnitudes[i], new_phases[i] = remap_and_lock_spectrum(
-            magnitudes[i], phases[i], true_freqs[i], running_phase,
-            shift_ratios[i], config
-        )
-
-    return new_magnitudes, new_phases
-
-
-def reconstruct_frame(magnitude, synthesized_phase, config):
-    complex_spectrum = magnitude * (np.cos(synthesized_phase) + 1j * np.sin(synthesized_phase))
-    frame = np.fft.irfft(complex_spectrum, n=config.frame_size)
-    return frame.astype(np.float32)
-
-
-def phase_vocoder_shift(frames, shift_ratios, config):
-    magnitudes, phases = compute_stft(frames, config)
-    true_freqs = compute_instantaneous_frequency(phases, config)
-    new_magnitudes, new_phases = shift_and_resynthesize_phase(
-        magnitudes, phases, true_freqs, shift_ratios, config
-    )
+    N = config.frame_size
+    H = config.hop_size
     num_frames = frames.shape[0]
-    shifted_frames = np.zeros((num_frames, config.frame_size), dtype=np.float32)
+    num_bins = N // 2 + 1
+    bins = np.arange(num_bins)
+    expected_advance = 2 * np.pi * bins * H / N
+    max_gain = np.log(10 ** (max_formant_gain_db / 20.0))
+
+    out = np.zeros((num_frames, N), dtype=np.float32)
+    prev_phase = None
+    theta_by_bin = np.zeros(num_bins)  # rotation applied last frame, per input bin
+
     for i in range(num_frames):
-        shifted_frames[i] = reconstruct_frame(new_magnitudes[i], new_phases[i], config)
-    return shifted_frames
+        X = np.fft.rfft(np.roll(frames[i].astype(np.float64), -(N // 2)))
+        mag = np.abs(X)
+        phase = np.angle(X)
+        ratio = float(shift_ratios[i])
 
+        peaks = find_peaks(mag)
+        owner = assign_regions(peaks, num_bins)
 
+        # measured phase advance per hop of each peak (radians) = its true frequency
+        if prev_phase is None:
+            omega = expected_advance[peaks]
+        else:
+            omega = expected_advance[peaks] + wrap_phase(
+                phase[peaks] - prev_phase[peaks] - expected_advance[peaks])
 
+        theta_peaks = wrap_phase(theta_by_bin[peaks] + (ratio - 1.0) * omega)
+        freq_in_bins = omega * N / (2 * np.pi * H)
+        dk_peaks = np.round((ratio - 1.0) * freq_in_bins).astype(int)
 
+        theta_full = np.zeros(num_bins)
+        dk_full = np.zeros(num_bins, dtype=int)
+        theta_full[peaks] = theta_peaks
+        dk_full[peaks] = dk_peaks
+        theta = theta_full[owner]
+        dest = bins + dk_full[owner]
+
+        if not np.any(dk_peaks) and not np.any(theta_peaks):
+            Y = X  # nothing to do: exact identity
+        else:
+            rotated = X * np.exp(1j * theta)
+            ok = (dest >= 0) & (dest < num_bins)
+            Y = (np.bincount(dest[ok], weights=rotated.real[ok], minlength=num_bins)
+                 + 1j * np.bincount(dest[ok], weights=rotated.imag[ok], minlength=num_bins))
+
+        if preserve_formants and ratio != 1.0:
+            log_env = spectral_envelope_log(mag, N, formant_coeffs)
+            warped = np.interp(bins / ratio, bins, log_env)
+            Y = Y * np.exp(np.clip(log_env - warped, -max_gain, max_gain))
+
+        out[i] = reconstruct_frame(Y, config)
+        prev_phase = phase
+        theta_by_bin = theta
+
+    return out
 
 
 """
@@ -278,6 +264,14 @@ def formant_preserve(shifted_frame, original_frame, config, num_coeffs=20):
     """
     Corrects a pitch-shifted frame so it keeps the ORIGINAL frame's formant
     shape instead of the shifted frame's (accidentally moved) formant shape.
+
+    LEGACY - kept for the CONTRACTS.md signature, no longer used by
+    run_pipeline. It estimates the shifted envelope from the shifted frame
+    itself; when the shift leaves gaps between harmonic regions, log(~0) in
+    those gaps drags that envelope down and this function boosts the frame
+    by up to +22 dB (measured). The pipeline uses
+    phase_vocoder_shift(..., preserve_formants=True), which uses the known
+    ratio instead.
 
     shifted_frame: np.ndarray, shape (frame_size,) - output of the phase
                    vocoder for this frame (pitch already shifted)

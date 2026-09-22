@@ -58,73 +58,102 @@ def apply_filter(audio, b, a):
     return filtered.astype(audio.dtype)
 
 
-def denoise_audio(audio: np.ndarray, sample_rate: int, frame_size: int = 1024, hop_size: int = 256, over_subtraction: float = 1.8, noise_floor: float = 0.05) -> np.ndarray:
+def denoise_audio(audio: np.ndarray, sample_rate: int, frame_size: int = 1024, hop_size: int = 256,
+                  over_subtraction: float = 1.5, noise_floor: float = 0.1,
+                  noise_percentile: float = 5.0, min_gap_contrast_db: float = 10.0,
+                  clean_snr_db: float = 60.0) -> np.ndarray:
     """
-    Spectral Subtraction Noise Reduction + Adaptive Noise Gate.
-    Estimates stationary background noise floor (hiss, fan hum, AC noise, ambient room noise)
-    from low-energy frames and subtracts it from the STFT magnitude spectrum.
+    Stationary noise reduction (hiss, fan hum, room tone) with a Wiener-style
+    spectral gain.
+
+    What changed and why (see docs/diagnosis.md):
+      * Noise estimate: the old code averaged the quietest 15% of frames
+        whether or not they were quiet. A dense vocal (rap, belted chorus)
+        has no silent frames, so that "noise" was actually voice; subtracting
+        1.8x of it hollowed the voice out. The noise is now estimated only
+        from real gaps, and if the track has none it is left alone.
+      * The old gate (threshold = 1.5 x the 20th-percentile frame level)
+        attenuated every frame near the typical level down to 0.15x on
+        consistent-level material. It is removed; the Wiener gain below
+        already suppresses gap noise.
+      * Gain: G = sqrt(max(1 - a*N/|X|^2, floor^2)). Bins well above the
+        noise get G ~ 1, so the voice is untouched. The floor limits damage
+        if the estimate is wrong. The gain is smoothed over 3 frames to avoid
+        "musical noise" (the watery/cloudy chirps of raw spectral subtraction).
+      * If the quiet frames are more than clean_snr_db below the loud ones
+        it's a clean studio stem and the input is returned untouched.
+      * Edges are padded so the first/last samples aren't lost or distorted.
     """
-    if len(audio) < frame_size:
-        return audio
+    from scipy.ndimage import uniform_filter1d
+
+    x = np.asarray(audio, dtype=np.float64)
+    if len(x) < frame_size:
+        return np.asarray(audio, dtype=np.float32)
 
     window = np.hanning(frame_size)
-    num_frames = (len(audio) - frame_size) // hop_size + 1
-    num_bins = frame_size // 2 + 1
+    padded = np.pad(x, (frame_size, frame_size + hop_size))
+    num_frames = (len(padded) - frame_size) // hop_size + 1
+    idx = np.arange(frame_size)[None, :] + hop_size * np.arange(num_frames)[:, None]
+    spec = np.fft.rfft(padded[idx] * window, axis=1)
+    power = np.abs(spec) ** 2
 
-    stft_mag = np.zeros((num_frames, num_bins), dtype=np.float32)
-    stft_phase = np.zeros((num_frames, num_bins), dtype=np.float32)
+    # Noise PSD from genuine GAPS only: frames within 3 dB of the quietest 5%
+    # of frames, and only if those are at least `min_gap_contrast_db` below the
+    # loud frames. A dense rap/compressed vocal has no such gaps (its quiet
+    # frames are still voice), and in that case stationary noise is masked by
+    # the voice anyway, so we leave the audio untouched instead of subtracting
+    # voice from itself (which measured -9 dB on a dense synthetic rap line).
+    frame_db = 10 * np.log10(power.sum(axis=1) + 1e-20)
+    quiet_db = np.percentile(frame_db, noise_percentile)
+    loud_db = np.percentile(frame_db, 95)
+    if loud_db - quiet_db < min_gap_contrast_db or loud_db - quiet_db > clean_snr_db:
+        return np.asarray(audio, dtype=np.float32)
+    gaps = frame_db <= quiet_db + 3.0
+    noise_psd = power[gaps].mean(axis=0)
 
+    gain_sq = 1.0 - over_subtraction * noise_psd[None, :] / np.maximum(power, 1e-20)
+    gain = np.sqrt(np.maximum(gain_sq, noise_floor ** 2))
+    gain = uniform_filter1d(gain, size=3, axis=0)
+
+    frames_out = np.fft.irfft(spec * gain, n=frame_size, axis=1) * window
+    out = np.zeros(len(padded))
+    win_sum = np.zeros(len(padded))
     for i in range(num_frames):
-        start = i * hop_size
-        frame = audio[start : start + frame_size] * window
-        spec = np.fft.rfft(frame)
-        stft_mag[i] = np.abs(spec)
-        stft_phase[i] = np.angle(spec)
-
-    # Estimate noise spectrum from the quietest 15% energy frames
-    frame_energies = np.mean(stft_mag ** 2, axis=1)
-    lowest_k = max(1, int(num_frames * 0.15))
-    quietest_indices = np.argsort(frame_energies)[:lowest_k]
-    noise_spectrum = np.mean(stft_mag[quietest_indices], axis=0)
-
-    # Spectral Subtraction
-    cleaned_mag = np.zeros_like(stft_mag)
-    for i in range(num_frames):
-        subtracted = stft_mag[i] - over_subtraction * noise_spectrum
-        floor = noise_floor * stft_mag[i]
-        cleaned_mag[i] = np.maximum(subtracted, floor)
-
-    # Adaptive Noise Gate for silence gaps
-    vocal_envelope = np.mean(cleaned_mag, axis=1)
-    gate_threshold = np.percentile(vocal_envelope, 20) * 1.5
-    gate_mask = np.clip((vocal_envelope - gate_threshold) / (gate_threshold + 1e-6), 0.0, 1.0)
-    smooth_mask = np.convolve(gate_mask, np.ones(5) / 5.0, mode='same')
-
-    for i in range(num_frames):
-        cleaned_mag[i] *= (0.15 + 0.85 * smooth_mask[i])
-
-    # Inverse STFT & Overlap-Add
-    output_len = (num_frames - 1) * hop_size + frame_size
-    clean_audio = np.zeros(output_len, dtype=np.float32)
-    win_sum = np.zeros(output_len, dtype=np.float32)
-
-    for i in range(num_frames):
-        start = i * hop_size
-        clean_spec = cleaned_mag[i] * np.exp(1j * stft_phase[i])
-        frame_rec = np.fft.irfft(clean_spec, n=frame_size) * window
-        clean_audio[start : start + frame_size] += frame_rec
-        win_sum[start : start + frame_size] += window ** 2
-
+        s = i * hop_size
+        out[s:s + frame_size] += frames_out[i]
+        win_sum[s:s + frame_size] += window ** 2
     nonzero = win_sum > 1e-8
-    clean_audio[nonzero] /= win_sum[nonzero]
+    out[nonzero] /= win_sum[nonzero]
 
-    # Pad or trim to match exact input length
-    if len(clean_audio) < len(audio):
-        clean_audio = np.pad(clean_audio, (0, len(audio) - len(clean_audio)))
-    else:
-        clean_audio = clean_audio[:len(audio)]
+    return out[frame_size:frame_size + len(x)].astype(np.float32)
 
-    return clean_audio.astype(np.float32)
+
+def soft_limit(audio: np.ndarray, sample_rate: int, ceiling: float = 0.98,
+               lookahead_ms: float = 2.5) -> np.ndarray:
+    """
+    Transparent peak limiter that replaces the old "scale the WHOLE file so
+    its single highest peak is 0.95" step, which let one transient set the
+    loudness of the entire song.
+
+    g[n] = min(1, ceiling/|x[n]|) is the gain each sample needs. A minimum
+    filter over +/-L samples followed by a smoothing kernel no wider than
+    +/-L keeps the gain curve smooth (no distortion) and guarantees
+    g_smooth[n] <= g[n], so |output| <= ceiling. Only the few milliseconds
+    around an over are turned down; the rest of the file is untouched.
+    """
+    from scipy.ndimage import minimum_filter1d
+
+    x = np.asarray(audio, dtype=np.float64)
+    peak = np.max(np.abs(x)) if len(x) else 0.0
+    if peak <= ceiling:
+        return np.asarray(audio, dtype=np.float32)
+    L = max(1, int(sample_rate * lookahead_ms / 1000.0))
+    need = np.minimum(1.0, ceiling / np.maximum(np.abs(x), 1e-12))
+    held = minimum_filter1d(need, size=2 * L + 1, mode='nearest')
+    kernel = np.hanning(2 * L + 3)[1:-1]
+    kernel /= kernel.sum()
+    smooth = np.convolve(np.pad(held, L, mode='edge'), kernel, mode='valid')
+    return (x * smooth).astype(np.float32)
 
 def plot_pole_zero(b, a, save_path):
     zeros, poles, _ = tf2zpk(b,a)

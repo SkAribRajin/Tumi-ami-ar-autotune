@@ -158,3 +158,16 @@ def run_pipeline(input_path: str, config: AutoTuneConfig,
 2. Build against these signatures even before the other person's code exists —
    use dummy/fake numpy arrays of the right shape to test your own piece in isolation.
 3. One branch per function/feature, PR into main, other person reviews before merge.
+
+---
+
+## Signature changes (see docs/fixes-applied.md)
+
+All backward compatible unless marked:
+- `frame_signal(audio, config, apply_window=True)`: `False` gives unwindowed frames at the same positions.
+- `overlap_add(frames, config, pad_len, length=None)`: pass `len(audio)` to get exactly that length.
+- `compute_shift_ratios(detected, target, strength=1.0, retune_ms=0.0, confidence=None, hop_size=512, sample_rate=44100, humanize_cents=0.0, max_correction_semitones=2.0)`: with the defaults it is still `(target/detected)**strength`, and 1.0 for unvoiced frames.
+- `phase_vocoder_shift(frames, shift_ratios, config, preserve_formants=False, ...)`.
+- `run_pipeline(...)`: **removed** `preserve_vibrato` and `onset_protection_ms` (now part of the retune filter); `use_preemphasis` now defaults to `False`. The result dict adds `confidence` and `makeup_gain`.
+- `smooth_shift_ratios`: **removed** (folded into `compute_shift_ratios`).
+- New: `pitch_detection.detect_pitch_track`, `detect_pitch_yin`; `scales.quantize_pitch_track`; `filters.soft_limit`.
